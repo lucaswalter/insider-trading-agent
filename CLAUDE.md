@@ -172,32 +172,172 @@ if [ ! -s /tmp/qualified.jsonl ]; then
   echo "No new filing is BOTH C-suite AND > \$1,000,000. Exiting — stopping the routine."
   exit 0
 fi
-echo "QUALIFYING FILINGS:"; cat /tmp/qualified.jsonl
+
+# ── ONE FILING PER RUN ─────────────────────────────────────────────────────
+# Process only the single newest qualifying filing. Rows were scanned top-down
+# and the page is sorted newest-first, so line 1 is the newest. Any extras are
+# logged (not silently dropped) but NOT researched this run.
+FILING=$(head -1 /tmp/qualified.jsonl)
+EXTRA=$(( $(wc -l < /tmp/qualified.jsonl) - 1 ))
+if [ "$EXTRA" -gt 0 ]; then
+  echo "NOTE: $EXTRA more qualifying filing(s) this run — NOT processed (one-per-run). For the record:"
+  tail -n +2 /tmp/qualified.jsonl
+fi
+export SYMBOL=$(printf '%s' "$FILING" | jq -r .symbol)
+export COMPANY=$(printf '%s' "$FILING" | jq -r .company)
+export ROLE=$(printf '%s' "$FILING" | jq -r .role)
+export AMOUNT=$(printf '%s' "$FILING" | jq -r .amount_usd)
+export FILING_URL=$(printf '%s' "$FILING" | jq -r .filing_url)
+echo "PROCESSING THIS RUN → $SYMBOL ($COMPANY) | $ROLE | \$$AMOUNT | $FILING_URL"
 ```
 
-### Step 6 — Record the qualifying detection(s)
+Everything below operates on this **one** filing.
 
-Append the high-signal hits to the detection log (audit trail) and commit.
+### Step 6 — Extract structured data from the Form 4 (Firecrawl Scrape + JSON)
+
+Use `/v2/scrape` with an inline `json` format (synchronous structured extraction — no need for
+the async `/v2/extract` job for a single page). This turns the messy Form 4 HTML into clean
+fields, including the **transaction code** (`S` = open-market sale, `F` = tax-withholding, `M` =
+option exercise, `G` = gift) and whether the sale was under a **Rule 10b5-1 plan** — both are
+decisive for how bearish the signal actually is.
 
 ```bash
-mkdir -p detections
-TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-while IFS= read -r q; do
-  printf '%s\n' "$q" | jq -c --arg ts "$TS" --arg check "$CHECK_ID" '. + {detected_at:$ts, check_id:$check}' \
-    >> detections/insider-sales.jsonl
-done < /tmp/qualified.jsonl
+cat > /tmp/form4_req.json <<JSON
+{
+  "url": "$FILING_URL",
+  "onlyMainContent": true,
+  "formats": [{
+    "type": "json",
+    "prompt": "Extract this SEC Form 4 filing. Include the reporting person (name, CIK, address), the issuer (name, ticker, CIK), the person's relationship and title, EVERY transaction row (which table, security title, transaction date, transaction code, acquired vs disposed, share count, price per share, shares owned after, and direct/indirect ownership), all footnotes verbatim, whether any footnote references a Rule 10b5-1 trading plan, and the signature date.",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "reporting_person": {"type":"object","properties":{"name":{"type":"string"},"cik":{"type":"string"},"address":{"type":"string"}}},
+        "issuer": {"type":"object","properties":{"name":{"type":"string"},"ticker":{"type":"string"},"cik":{"type":"string"}}},
+        "relationship": {"type":"string"},
+        "transactions": {"type":"array","items":{"type":"object","properties":{
+          "table":{"type":"string"},"security_title":{"type":"string"},"date":{"type":"string"},
+          "transaction_code":{"type":"string"},"acquired_or_disposed":{"type":"string"},
+          "shares":{"type":"number"},"price":{"type":"number"},
+          "shares_owned_after":{"type":"number"},"ownership":{"type":"string"}}}},
+        "footnotes": {"type":"array","items":{"type":"string"}},
+        "rule_10b5_1_plan": {"type":"boolean"},
+        "signature_date": {"type":"string"}
+      }
+    }
+  }]
+}
+JSON
+FORM4=$(curl -s -X POST https://api.firecrawl.dev/v2/scrape -H "$AUTH" -H "Content-Type: application/json" -d @/tmp/form4_req.json | jq '.data.json')
+echo "$FORM4" | jq .
+TICKER=$(echo "$FORM4" | jq -r '.issuer.ticker // env.SYMBOL')
+PERSON=$(echo "$FORM4" | jq -r '.reporting_person.name // "the insider"')
+```
 
-git add detections/insider-sales.jsonl && \
-  git commit -m "Qualifying insider sale(s) — C-suite > \$1M — check $CHECK_ID" || \
+If a field comes back null/empty, fall back to scraping the issuer or insider page (their
+`secform4.com/insider-trading/<cik>.htm` links) for more context before continuing.
+
+### Step 7 — Deep research (Firecrawl Search — you write the queries)
+
+Firecrawl's standalone `/deep-research` endpoint is deprecated and `/research` is a papers
+index — so **run the research yourself** as an iterative loop over `/v2/search`, which is the
+production tool for this. You are the researcher: form hypotheses, write queries, read results,
+follow the threads that matter, and search again. Aim for a well-rounded evidence base, not a
+fixed number of calls.
+
+Helper (search → web + news results with titles, urls, snippets):
+
+```bash
+fc_search() {  # fc_search "query" [sources_csv] [tbs]   e.g. fc_search "HAL stock outlook" web,news qdr:m
+  local q="$1" src="${2:-web,news}" tbs="${3:-}"
+  local sj; sj=$(printf '%s' "$src" | jq -Rc 'split(",")')
+  jq -nc --arg q "$q" --argjson s "$sj" --arg tbs "$tbs" \
+    '{query:$q, sources:$s, limit:6} + (if $tbs=="" then {} else {tbs:$tbs} end)' > /tmp/search_req.json
+  # NOTE: /v2/search nests results under .data.{web,news}; web items use .description, news items use .snippet + .date
+  curl -s -X POST https://api.firecrawl.dev/v2/search -H "$AUTH" -H "Content-Type: application/json" -d @/tmp/search_req.json \
+    | jq -r '(.data.web//[])[]?  | "WEB  | \(.title) | \(.url)\n       \(.description // "")",
+             (.data.news//[])[]? | "NEWS | \(.title) | \(.url) | \(.date // "")\n       \(.snippet // "")"'
+}
+```
+
+Cover these axes (write your own queries; these are starting points — adapt to what you find):
+
+- **The company** — `"$COMPANY" latest news`, earnings/guidance, downgrades, litigation, M&A, layoffs.
+- **The stock** — `"$TICKER" stock price target analyst`, valuation, short interest, recent moves.
+- **The individual** — `"$PERSON" "$COMPANY"` — tenure, departures, a *pattern* of prior sales, any cause for concern.
+- **Industry / macro** — sector outlook and the specific drivers for this company (e.g. for an oilfield-services name: crude prices, rig counts, capex cycles), plus competitors.
+- **Anything else** the filing surfaces (a footnote, a subsidiary, a co-filer) that could move the thesis.
+
+Recency: **`tbs` (`qdr:d|w|m|y`) only filters `web` results, not `news`.** Use `sources:["news"]`
+(already recency-ranked) for fresh headlines, and `web` + `tbs` for time-boxed background. When a
+result looks pivotal, pull its full text with `/v2/scrape` (markdown) before relying on it.
+
+```bash
+# deep-read a pivotal source:
+curl -s -X POST https://api.firecrawl.dev/v2/scrape -H "$AUTH" -H "Content-Type: application/json" \
+  -d "{\"url\":\"<url>\",\"formats\":[\"markdown\"],\"onlyMainContent\":true}" | jq -r '.data.markdown'
+```
+
+### Step 8 — Synthesize the research report
+
+Write the report **yourself** from the Form 4 facts (Step 6) + your research (Step 7). Save it to
+`reports/<txn-date>-<TICKER>-<lastname>.md`. Every non-obvious claim gets an inline source URL.
+Use this structure:
+
+```markdown
+# <COMPANY> (<TICKER>) — Insider Sale Research Report
+_Reporting person:_ <name>, <title> · _Transaction:_ <shares> @ $<price> = $<amount> on <date>
+_Filing:_ <FILING_URL> · _Report generated:_ <UTC timestamp>
+
+## 1. The transaction at a glance
+- What was sold, by whom, for how much, and against how large a remaining stake.
+- **Transaction code** (S / F / M / G) and **10b5-1 plan?** — say plainly whether this is a
+  discretionary open-market sale (more meaningful) or planned/mechanical (less meaningful).
+
+## 2. Signal read
+- How bearish/neutral is this, and why (magnitude vs holdings, role, discretionary vs planned,
+  cluster of insiders vs lone seller).
+
+## 3. Company
+- What the company does; recent developments, results, guidance, risks. [sources]
+
+## 4. Stock
+- Recent price action, valuation, analyst targets/sentiment, notable positioning. [sources]
+
+## 5. The individual
+- Role/tenure and any track record or pattern in prior sales. [sources]
+
+## 6. Industry & macro
+- Sector outlook and the specific drivers/competitors that bear on this name. [sources]
+
+## 7. Synthesis → buy / sell / hold lean
+- A clear lean with confidence (low/med/high), the 2–3 reasons that drive it, and the key risks
+  that would flip it. Research synthesis, not financial advice.
+
+## 8. Caveats
+- **Timing mismatch:** the public feed is ~6 months delayed, so this filing is historical while
+  the research reflects today — call out where that gap matters.
+
+## Sources
+- <every URL relied on>
+```
+
+### Step 9 — Record and deliver
+
+```bash
+mkdir -p reports detections
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+REPORT_PATH="reports/$(echo "$FORM4" | jq -r '(.transactions[0].date // "undated")' | tr '/' '-')-${TICKER}-$(echo "$PERSON" | awk '{print $1}').md"
+# (write the report to $REPORT_PATH, then:)
+printf '%s\n' "$FILING" | jq -c --arg ts "$TS" --arg check "$CHECK_ID" --arg r "$REPORT_PATH" \
+  '. + {detected_at:$ts, check_id:$check, report:$r}' >> detections/insider-sales.jsonl
+git add reports detections && \
+  git commit -m "Research report: ${TICKER} insider sale — check $CHECK_ID" || \
   echo "(nothing to commit or git unavailable — continuing)"
 ```
 
-### Step 7 — Act on the qualifying filing(s)  ⟵ EXTENSION POINT (business action still TBD)
-
-Only filings in `/tmp/qualified.jsonl` reach here — each is a C-suite sale over $1M. The final
-action isn't defined yet (do **not** invent one). Candidates: post a summary to Slack (the
-Slack MCP connector is attached to this routine — supply a channel to enable), open the linked
-Form 4 for deeper analysis, or hand off to a downstream system. Until defined, stop after Step 6.
+**Optional delivery (extension):** the Slack MCP connector is attached to this routine — post a
+short summary + the buy/sell lean + the report path to a channel once you decide which one.
 
 ## Prototype caveats
 
