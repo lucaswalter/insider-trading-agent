@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build / output artifacts
+dist/
+build/
+*.pdf
+out/
