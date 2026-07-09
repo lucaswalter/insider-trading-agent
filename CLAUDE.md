@@ -88,38 +88,116 @@ echo "NEW FILING(S) DETECTED:"
 echo "$ADDED_ROWS"
 ```
 
-### Step 4 — Record the detection
+### Step 4 — Extract role + transaction amount for each new filing
 
-Append each new filing to the detection log (audit trail) and commit it. Capture the
-judge's reasons for context.
+Each added row is a markdown table row with these columns (pipe-delimited):
+
+| # | Column | awk field (`-F'\|'`) |
+|---|--------|----------------------|
+| c1 | Transaction Date + type | `$2` |
+| c2 | Reported DateTime | `$3` |
+| c3 | Company | `$4` |
+| c4 | Symbol | `$5` |
+| c5 | **Insider Relationship** (name + role) | `$6` |
+| c6 | Shares Traded | `$7` |
+| c7 | Average Price | `$8` |
+| c8 | **Total Amount** ($ value of the sale) | `$9` |
+| c9 | Shares Owned | `$10` |
+| c10 | Filing (`View` link) | `$11` |
+
+The two fields the gates need — the **role** (c5) and the **Total Amount** (c8) — are in the
+row for essentially every filing, so no extra fetch is normally required. **Firecrawl is the
+fallback** when a row is missing or ambiguous (empty/garbled role, or a `$0`/blank Total
+Amount): scrape the filing's `View` page (c10) or the insider's page and read the reporting
+person's title and the transaction total from there —
+
+```bash
+# Fallback context fetch (only when the row itself is insufficient):
+curl -s -X POST https://api.firecrawl.dev/v2/scrape -H "$AUTH" -H "Content-Type: application/json" \
+  -d "{\"url\":\"$VIEW_LINK\",\"formats\":[\"markdown\"],\"onlyMainContent\":true}" | jq -r '.data.markdown'
+```
+
+### Step 5 — Qualifying gates: C-suite **AND** Total Amount > $1,000,000
+
+Keep a filing **only if both** hold. **Interpretation: this is an AND** — "only interested in
+sales > $1M" is a hard floor, so a $1M+ sale by a non-exec is dropped, and a C-suite sale
+under $1M is dropped. (If you ever want OR instead, change the `&&` in the gate below to `||`.)
+
+**C-suite** = the reporting person holds a chief-level executive title: any `Chief … Officer`
+(CEO, CFO, CTO, COO, CIO, CMO, CLO, CAO, CHRO, CISO, CRO, CCO, …) or **President**. Excluded:
+Director, 10% Owner, plain General Counsel, Secretary/Treasurer, and VP/EVP/SVP that isn't a
+chief title. Roles are messy free text and rows can list several parties — **use judgment**,
+and pull the filing via Firecrawl (Step 4) when a title is genuinely unclear. Passing the role
+gate needs **any one** listed party to be C-suite.
+
+```bash
+MIN_USD=1000000
+: > /tmp/qualified.jsonl
+
+is_csuite() {  # role text -> exit 0 if C-suite
+  local r; r=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  printf '%s' "$r" | grep -qE 'chief[a-z &.,/()-]*officer|\b(ceo|cfo|cto|coo|cio|cmo|clo|cao|chro|ciso|cro|cco|cdo|cgo)\b' && return 0
+  printf '%s' "$r" | grep -qE '\bpresident\b' && ! printf '%s' "$r" | grep -qE 'vice[ -]president' && return 0
+  return 1
+}
+
+printf '%s\n' "$ADDED_ROWS" | while IFS= read -r row; do
+  [ -z "$row" ] && continue
+  line=$(printf '%s' "$row" | sed 's/^+//')
+  relationship=$(printf '%s' "$line" | awk -F'|' '{print $6}')
+  company=$(printf '%s' "$line" | awk -F'|' '{print $4}' | sed -E 's/\[([^]]*)\].*/\1/; s/^ *//; s/ *$//')
+  symbol=$(printf '%s' "$line"  | awk -F'|' '{print $5}' | sed -E 's/\[([^]]*)\].*/\1/; s/^ *//; s/ *$//')
+  total_cell=$(printf '%s' "$line" | awk -F'|' '{print $9}')
+  VIEW_LINK=$(printf '%s' "$line" | awk -F'|' '{print $11}' | grep -oE 'https?://[^) ]+' | head -1)
+
+  # Total Amount -> integer USD (handles "$19,246,616", "$0", blanks)
+  amount=$(printf '%s' "$total_cell" | grep -oE '[0-9][0-9,]*' | head -1 | tr -d ',')
+  # Role text = relationship cell minus the [Name](link) parts (what's left is the title(s))
+  role_text=$(printf '%s' "$relationship" | sed -E 's/\[[^]]*\]\([^)]*\)//g; s/<br>/ ; /g; s/^[ ;]*//; s/[ ;]*$//')
+
+  # If role or amount is missing/ambiguous, resolve via Firecrawl (Step 4) before deciding.
+
+  role_ok=no;  is_csuite "$role_text" && role_ok=yes
+  amt_ok=no;   [ -n "$amount" ] && [ "$amount" -gt "$MIN_USD" ] && amt_ok=yes
+
+  echo "• $symbol ($company) | role='$role_text' csuite=$role_ok | amount=\$${amount:-?} over1M=$amt_ok"
+  if [ "$role_ok" = yes ] && [ "$amt_ok" = yes ]; then      # <-- AND gate (see note above)
+    jq -nc --arg s "$symbol" --arg c "$company" --arg r "$role_text" \
+           --argjson a "${amount:-0}" --arg v "$VIEW_LINK" \
+      '{symbol:$s, company:$c, role:$r, amount_usd:$a, filing_url:$v}' >> /tmp/qualified.jsonl
+  fi
+done
+
+if [ ! -s /tmp/qualified.jsonl ]; then
+  echo "No new filing is BOTH C-suite AND > \$1,000,000. Exiting — stopping the routine."
+  exit 0
+fi
+echo "QUALIFYING FILINGS:"; cat /tmp/qualified.jsonl
+```
+
+### Step 6 — Record the qualifying detection(s)
+
+Append the high-signal hits to the detection log (audit trail) and commit.
 
 ```bash
 mkdir -p detections
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-echo "$DETAIL" | jq -c --arg ts "$TS" --arg check "$CHECK_ID" '
-  .data.pages[]? | select(.judgment.meaningful == true) |
-  {detected_at: $ts, check_id: $check, url: .url,
-   reason: .judgment.reason,
-   changes: [.judgment.meaningfulChanges[]? | select(.type == "added")],
-   diff: .diff.text}' >> detections/insider-sales.jsonl
+while IFS= read -r q; do
+  printf '%s\n' "$q" | jq -c --arg ts "$TS" --arg check "$CHECK_ID" '. + {detected_at:$ts, check_id:$check}' \
+    >> detections/insider-sales.jsonl
+done < /tmp/qualified.jsonl
 
 git add detections/insider-sales.jsonl && \
-  git commit -m "Detect new insider-sale filing(s) — check $CHECK_ID" || \
+  git commit -m "Qualifying insider sale(s) — C-suite > \$1M — check $CHECK_ID" || \
   echo "(nothing to commit or git unavailable — continuing)"
 ```
 
-### Step 5 — Act on the new filing  ⟵ EXTENSION POINT (define the business action)
+### Step 7 — Act on the qualifying filing(s)  ⟵ EXTENSION POINT (business action still TBD)
 
-This is where the pipeline's actual behavior goes once decided. Options on the table
-(none wired yet — do **not** invent one):
-
-- Post a summary of the new filing(s) to Slack (the Slack MCP connector is attached to
-  this routine — supply the target channel to enable).
-- Parse each added row into structured fields (ticker, insider, role, shares, $ amount,
-  ownership) and run analysis.
-- Open the linked Form 4 filing (`View` link in the row) for detail.
-
-Until this is defined, stop after Step 4. The detection is safely logged.
+Only filings in `/tmp/qualified.jsonl` reach here — each is a C-suite sale over $1M. The final
+action isn't defined yet (do **not** invent one). Candidates: post a summary to Slack (the
+Slack MCP connector is attached to this routine — supply a channel to enable), open the linked
+Form 4 for deeper analysis, or hand off to a downstream system. Until defined, stop after Step 6.
 
 ## Prototype caveats
 
