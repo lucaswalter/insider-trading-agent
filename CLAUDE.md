@@ -325,40 +325,55 @@ python3 tools/render_report.py /tmp/report.json "$PDF"
 echo "Rendered $PDF ($(wc -c < "$PDF") bytes)"
 ```
 
-### Step 9 — Deliver the PDF to Slack (DM)
+### Step 9 — Host the PDF and DM the signal to Slack
 
-Deliver to the DM channel **`D07D9AXBPTL`**: the PDF, plus a short message carrying the
-recommendation. Uploading a file needs the Slack **Web API** with a bot token — `SLACK_BOT_TOKEN`
-(scope `files:write`, and the app must be able to post to that DM) set as a routine secret. **The
-attached Slack MCP connector can post messages but cannot upload files**, so the token is required
-for the PDF itself.
+Host the PDF on **tmpfiles.org** (no auth) to get a shareable review/download link, then DM the DM
+channel **`D07D9AXBPTL`** via the Slack **`slack_send_message`** MCP tool. This needs **no bot token
+and no `files:write`** — just the attached Slack connector. The message leads with the signal so it
+is scannable straight from the DM list. This is delivery **instead of** committing — nothing is
+committed to the repo.
 
 ```bash
-SLACK_DM=D07D9AXBPTL
-SUMMARY="*$SYMBOL* — $(jq -r .recommendation /tmp/report.json) (confidence: $(jq -r .confidence /tmp/report.json)). $(jq -r .one_liner /tmp/report.json)"
-
-if [ -n "$SLACK_BOT_TOKEN" ]; then
-  SB="Authorization: Bearer $SLACK_BOT_TOKEN"
-  # 1) reserve an upload URL
-  UP=$(curl -s -G "https://slack.com/api/files.getUploadURLExternal" -H "$SB" \
-        --data-urlencode "filename=$(basename "$PDF")" --data-urlencode "length=$(wc -c < "$PDF")")
-  UURL=$(echo "$UP" | jq -r .upload_url); FID=$(echo "$UP" | jq -r .file_id)
-  # 2) upload the bytes
-  curl -s -X POST "$UURL" -F "file=@$PDF" >/dev/null
-  # 3) complete + share into the DM, with the summary as the comment
-  DONE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" -H "$SB" -H "Content-Type: application/json" \
-    -d "$(jq -nc --arg id "$FID" --arg t "$SYMBOL insider-sale report" --arg ch "$SLACK_DM" --arg c "$SUMMARY" \
-         '{files:[{id:$id,title:$t}], channel_id:$ch, initial_comment:$c}')")
-  echo "$DONE" | jq -e '.ok' >/dev/null && echo "Delivered PDF to Slack DM $SLACK_DM." \
-    || echo "Slack upload failed: $(echo "$DONE" | jq -r '.error // "unknown"') — fall back to a text DM below."
-fi
+# Upload to tmpfiles (expire=172800s = 48h max, so the link survives long enough to review)
+UP=$(curl -s -X POST https://tmpfiles.org/api/v1/upload -F "file=@$PDF" -F "expire=172800")
+LINK=$(echo "$UP" | jq -r '.data.url // empty')   # -> https://tmpfiles.org/<id>/<name>.pdf (a review+download page)
+[ -z "$LINK" ] && echo "tmpfiles upload failed: $UP"
+REC=$(jq -r .recommendation /tmp/report.json); CONF=$(jq -r .confidence /tmp/report.json)
+echo "signal=$REC conf=$CONF link=$LINK"
 ```
 
-If `SLACK_BOT_TOKEN` is **not** set (or the upload reported an error), fall back to posting a DM via
-the Slack **`slack_send_message`** MCP tool (`channel_id = D07D9AXBPTL`): include the recommendation,
-confidence, one-liner, the at-a-glance bullets, and the source list, and state plainly that the PDF
-could not be uploaded because no `files:write` token is configured. This is delivery **instead of**
-committing the report — nothing is committed to the repo in this step.
+Then call the **`slack_send_message`** MCP tool with `channel_id = "D07D9AXBPTL"` and a markdown
+`message` that contains, **in this order**:
+
+1. **The signal, unmistakably** — the call with an emoji cue (🟢 `BUY` · 🔴 `SELL` · 🟡 `HOLD` /
+   `NEUTRAL`) and the ticker, e.g. `🟡 *HOLD — $HAL (Halliburton)*`.
+2. **Confidence** — e.g. `Confidence: *Medium*`.
+3. **One line of what happened** — who sold how much, when (from `transaction`).
+4. **3–4 quick “why” bullets** — the reasons driving the call (from `summary_bullets`).
+5. **The link** — a labelled markdown link so it reads nicely, e.g.
+   `📄 [Review & download the full report](<LINK>)`. If unsure Slack will render the label, put the
+   bare `$LINK` on its own line — a bare URL is always clickable.
+6. **Footer** — `_Link expires in ~48h · automated research, not financial advice_`.
+
+Example `message` body:
+
+```
+🟡 *HOLD — $HAL (Halliburton)*   ·   Confidence: *Medium*
+
+Jeffrey Slocum (EVP & COO) sold $771,808 on 2026-01-09.
+
+*Why:*
+• Pre-planned 10b5-1 sale (plan set Aug 2025) — mechanical, not a discretionary bearish call.
+• Small & partial — ~11% of his stake trimmed; ~187K shares retained.
+• Newly-promoted COO (effective Jan 1 2026), not a departure.
+• Backdrop mildly constructive: Q1 2026 beat, Moderate-Buy consensus, low-$40s targets.
+
+📄 [Review & download the full report](https://tmpfiles.org/…/2026-01-09-hal-slocum.pdf)
+_Link expires in ~48h · automated research, not financial advice_
+```
+
+If the tmpfiles upload failed, still send the DM with the signal + confidence + bullets and note the
+report link was unavailable this run.
 
 ## Prototype caveats
 
