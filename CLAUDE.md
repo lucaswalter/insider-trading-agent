@@ -278,66 +278,87 @@ curl -s -X POST https://api.firecrawl.dev/v2/scrape -H "$AUTH" -H "Content-Type:
   -d "{\"url\":\"<url>\",\"formats\":[\"markdown\"],\"onlyMainContent\":true}" | jq -r '.data.markdown'
 ```
 
-### Step 8 — Synthesize the research report
+### Step 8 — Synthesize the report and render it to a PDF
 
-Write the report **yourself** from the Form 4 facts (Step 6) + your research (Step 7). Save it to
-`reports/<txn-date>-<TICKER>-<lastname>.md`. Every non-obvious claim gets an inline source URL.
-Use this structure:
+Write the analysis **yourself** from the Form 4 facts (Step 6) + your research (Step 7) as a single
+JSON object at `/tmp/report.json`, then render it to a clean PDF with the repo's
+`tools/render_report.py` (reportlab; the presentation is fixed so every report looks the same — you
+own the content). The PDF leads with the **recommendation + one-liner + at-a-glance bullets**, then
+the transaction facts, then the grounding sections — so the buy/sell call is readable in five seconds
+and everything beneath it backs that call up.
 
-```markdown
-# <COMPANY> (<TICKER>) — Insider Sale Research Report
-_Reporting person:_ <name>, <title> · _Transaction:_ <shares> @ $<price> = $<amount> on <date>
-_Filing:_ <FILING_URL> · _Report generated:_ <UTC timestamp>
+`/tmp/report.json` shape (put an inline source URL next to each non-obvious claim in the section
+bodies, and list every URL in `sources`):
 
-## 1. The transaction at a glance
-- What was sold, by whom, for how much, and against how large a remaining stake.
-- **Transaction code** (S / F / M / G) and **10b5-1 plan?** — say plainly whether this is a
-  discretionary open-market sale (more meaningful) or planned/mechanical (less meaningful).
-
-## 2. Signal read
-- How bearish/neutral is this, and why (magnitude vs holdings, role, discretionary vs planned,
-  cluster of insiders vs lone seller).
-
-## 3. Company
-- What the company does; recent developments, results, guidance, risks. [sources]
-
-## 4. Stock
-- Recent price action, valuation, analyst targets/sentiment, notable positioning. [sources]
-
-## 5. The individual
-- Role/tenure and any track record or pattern in prior sales. [sources]
-
-## 6. Industry & macro
-- Sector outlook and the specific drivers/competitors that bear on this name. [sources]
-
-## 7. Synthesis → buy / sell / hold lean
-- A clear lean with confidence (low/med/high), the 2–3 reasons that drive it, and the key risks
-  that would flip it. Research synthesis, not financial advice.
-
-## 8. Caveats
-- **Timing mismatch:** the public feed is ~6 months delayed, so this filing is historical while
-  the research reflects today — call out where that gap matters.
-
-## Sources
-- <every URL relied on>
+```json
+{
+  "ticker": "<TICKER>", "company": "<COMPANY>", "generated_utc": "<UTC timestamp>",
+  "recommendation": "BUY | SELL | HOLD | NEUTRAL | AVOID",
+  "confidence": "Low | Medium | High",
+  "one_liner": "One-sentence bottom line — the first thing the reader sees.",
+  "summary_bullets": ["3–6 at-a-glance points that justify the call"],
+  "transaction": {"person":"", "title":"", "date":"", "code":"S|F|M|G", "plan_10b5_1": true,
+                  "shares":0, "price":0, "amount":0, "ownership":"Direct|Indirect",
+                  "stake_context":"size vs remaining holdings"},
+  "sections": [
+    {"heading":"Signal read", "body":"How bearish/neutral and why: magnitude vs holdings, role, discretionary vs 10b5-1, lone seller vs cluster.", "sources":["url"]},
+    {"heading":"Company", "body":"What it does; recent results, guidance, risks.", "sources":["url"]},
+    {"heading":"Stock", "body":"Price action, valuation, analyst targets/sentiment.", "sources":["url"]},
+    {"heading":"The individual", "body":"Role/tenure; any track record or pattern of prior sales.", "sources":["url"]},
+    {"heading":"Industry & macro", "body":"Sector outlook and the drivers/competitors that bear on this name.", "sources":["url"]},
+    {"heading":"Why this call", "body":"The 2–3 reasons driving the lean and the risks that would flip it."}
+  ],
+  "sources": ["every url relied on"],
+  "caveats": "Timing mismatch: the public feed is ~6 months delayed, so this filing is historical while the research reflects today — say where that gap matters."
+}
 ```
 
-### Step 9 — Record and deliver
+Section bodies support simple markdown (`**bold**`, `_italic_`, `- bullets`, blank-line paragraphs).
+Set `recommendation` decisively — it drives the coloured banner (green BUY / red SELL / amber HOLD).
 
 ```bash
-mkdir -p reports detections
-TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-REPORT_PATH="reports/$(echo "$FORM4" | jq -r '(.transactions[0].date // "undated")' | tr '/' '-')-${TICKER}-$(echo "$PERSON" | awk '{print $1}').md"
-# (write the report to $REPORT_PATH, then:)
-printf '%s\n' "$FILING" | jq -c --arg ts "$TS" --arg check "$CHECK_ID" --arg r "$REPORT_PATH" \
-  '. + {detected_at:$ts, check_id:$check, report:$r}' >> detections/insider-sales.jsonl
-git add reports detections && \
-  git commit -m "Research report: ${TICKER} insider sale — check $CHECK_ID" || \
-  echo "(nothing to commit or git unavailable — continuing)"
+mkdir -p reports
+python3 -m pip install --quiet reportlab 2>/dev/null || pip3 install --quiet reportlab 2>/dev/null || true
+PDF="reports/$(echo "$FORM4" | jq -r '(.transactions[0].date // "undated")' | tr '/' '-')-${TICKER}-$(echo "$PERSON" | awk '{print $1}').pdf"
+python3 tools/render_report.py /tmp/report.json "$PDF"
+[ -s "$PDF" ] || { echo "PDF render failed — not delivering a broken file."; exit 1; }
+echo "Rendered $PDF ($(wc -c < "$PDF") bytes)"
 ```
 
-**Optional delivery (extension):** the Slack MCP connector is attached to this routine — post a
-short summary + the buy/sell lean + the report path to a channel once you decide which one.
+### Step 9 — Deliver the PDF to Slack (DM)
+
+Deliver to the DM channel **`D07D9AXBPTL`**: the PDF, plus a short message carrying the
+recommendation. Uploading a file needs the Slack **Web API** with a bot token — `SLACK_BOT_TOKEN`
+(scope `files:write`, and the app must be able to post to that DM) set as a routine secret. **The
+attached Slack MCP connector can post messages but cannot upload files**, so the token is required
+for the PDF itself.
+
+```bash
+SLACK_DM=D07D9AXBPTL
+SUMMARY="*$SYMBOL* — $(jq -r .recommendation /tmp/report.json) (confidence: $(jq -r .confidence /tmp/report.json)). $(jq -r .one_liner /tmp/report.json)"
+
+if [ -n "$SLACK_BOT_TOKEN" ]; then
+  SB="Authorization: Bearer $SLACK_BOT_TOKEN"
+  # 1) reserve an upload URL
+  UP=$(curl -s -G "https://slack.com/api/files.getUploadURLExternal" -H "$SB" \
+        --data-urlencode "filename=$(basename "$PDF")" --data-urlencode "length=$(wc -c < "$PDF")")
+  UURL=$(echo "$UP" | jq -r .upload_url); FID=$(echo "$UP" | jq -r .file_id)
+  # 2) upload the bytes
+  curl -s -X POST "$UURL" -F "file=@$PDF" >/dev/null
+  # 3) complete + share into the DM, with the summary as the comment
+  DONE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" -H "$SB" -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg id "$FID" --arg t "$SYMBOL insider-sale report" --arg ch "$SLACK_DM" --arg c "$SUMMARY" \
+         '{files:[{id:$id,title:$t}], channel_id:$ch, initial_comment:$c}')")
+  echo "$DONE" | jq -e '.ok' >/dev/null && echo "Delivered PDF to Slack DM $SLACK_DM." \
+    || echo "Slack upload failed: $(echo "$DONE" | jq -r '.error // "unknown"') — fall back to a text DM below."
+fi
+```
+
+If `SLACK_BOT_TOKEN` is **not** set (or the upload reported an error), fall back to posting a DM via
+the Slack **`slack_send_message`** MCP tool (`channel_id = D07D9AXBPTL`): include the recommendation,
+confidence, one-liner, the at-a-glance bullets, and the source list, and state plainly that the PDF
+could not be uploaded because no `files:write` token is configured. This is delivery **instead of**
+committing the report — nothing is committed to the repo in this step.
 
 ## Prototype caveats
 
