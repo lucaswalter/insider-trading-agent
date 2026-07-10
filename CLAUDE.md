@@ -328,7 +328,8 @@ echo "Rendered $PDF ($(wc -c < "$PDF") bytes)"
 ### Step 9 — Host the PDF and DM the signal to Slack
 
 Host the PDF on **tmpfiles.org** (no auth) to get a shareable review/download link, then DM the DM
-channel **`D07D9AXBPTL`** via the Slack **`slack_send_message`** MCP tool. This needs **no bot token
+channel **`D99D96Y9Y`** (Lucas's DM in the CoinLedger workspace — the workspace the attached Slack
+connector is authed to) via the Slack **`slack_send_message`** MCP tool. This needs **no bot token
 and no `files:write`** — just the attached Slack connector. The message leads with the signal so it
 is scannable straight from the DM list. This is delivery **instead of** committing — nothing is
 committed to the repo.
@@ -342,7 +343,7 @@ REC=$(jq -r .recommendation /tmp/report.json); CONF=$(jq -r .confidence /tmp/rep
 echo "signal=$REC conf=$CONF link=$LINK"
 ```
 
-Then call the **`slack_send_message`** MCP tool with `channel_id = "D07D9AXBPTL"` and a markdown
+Then call the **`slack_send_message`** MCP tool with `channel_id = "D99D96Y9Y"` and a markdown
 `message` that contains, **in this order**:
 
 1. **The signal, unmistakably** — the call with an emoji cue (🟢 `BUY` · 🔴 `SELL` · 🟡 `HOLD` /
